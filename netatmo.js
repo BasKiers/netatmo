@@ -11,6 +11,8 @@ var client_id;
 var client_secret;
 var scope;
 var access_token;
+var refresh_token;
+var auth_refresh_timeout;
 
 /**
  * @constructor
@@ -18,7 +20,9 @@ var access_token;
  */
 var netatmo = function (args) {
   EventEmitter.call(this);
-  this.authenticate(args);
+  if(args) {
+    this.authenticate(args);
+  }
 };
 
 util.inherits(netatmo, EventEmitter);
@@ -32,15 +36,17 @@ util.inherits(netatmo, EventEmitter);
  * @param critical
  * @returns {Error}
  */
-netatmo.prototype.handleRequestError = function (err, response, body, message, critical) {
+netatmo.prototype.handleRequestError = function (err, response, body, message, critical, retry) {
   var errorMessage = "";
-  if (body && response.headers['content-type'] === 'application/json') {
+  if(refresh_token && body && body.error && (body.error.code === 2 || body.error.code === 3)){
+    //auth token is expired, refresh it and retry
+    return authenticate_refresh(refresh_token, retry);
+  } else if (body && response.headers['content-type'] === 'application/json') {
     errorMessage = JSON.parse(body);
     errorMessage = errorMessage && (errorMessage.error.message || errorMessage.error);
   } else if (typeof response !== 'undefined') {
     errorMessage = "Status code" + response.statusCode;
-  }
-  else {
+  } else {
     errorMessage = "No response";
   }
   var error = new Error(message + ": " + errorMessage);
@@ -65,7 +71,11 @@ netatmo.prototype.authenticate = function (args, callback) {
   }
 
   if (args.access_token) {
+    client_id = args.client_id;
+    client_secret = args.client_secret;
     access_token = args.access_token;
+    refresh_token = args.refresh_token;
+    this.emit('authenticated');
     return this;
   }
 
@@ -79,30 +89,58 @@ netatmo.prototype.authenticate = function (args, callback) {
     return this;
   }
 
-  if (!args.username) {
-    this.emit("error", new Error("Authenticate 'username' not set."));
-    return this;
+  var form = {};
+
+  if(args.code) {
+    if (!args.redirect_uri) {
+      this.emit("error", new Error("Authenticate 'code' set but 'redirect_uri' not set."));
+      return this;
+    }
+
+    Object.assign(
+      form,
+      {
+        code: args.code,
+        redirect_uri: args.redirect_uri,
+        grant_type: 'authorization_code'
+      }
+    );
+  } else {
+    if (!args.username) {
+      this.emit("error", new Error("Authenticate 'username' not set."));
+      return this;
+    }
+
+    if (!args.password) {
+      this.emit("error", new Error("Authenticate 'password' not set."));
+      return this;
+    }
+
+    username = args.username;
+    password = args.password;
+
+    Object.assign(
+      form,
+      {
+        username: username,
+        password: password,
+        grant_type: 'password'
+      }
+    );
   }
 
-  if (!args.password) {
-    this.emit("error", new Error("Authenticate 'password' not set."));
-    return this;
-  }
-
-  username = args.username;
-  password = args.password;
   client_id = args.client_id;
   client_secret = args.client_secret;
   scope = args.scope || 'read_station read_thermostat write_thermostat read_camera';
 
-  var form = {
-    client_id: client_id,
-    client_secret: client_secret,
-    username: username,
-    password: password,
-    scope: scope,
-    grant_type: 'password',
-  };
+  Object.assign(
+    form,
+    {
+      client_id: client_id,
+      client_secret: client_secret,
+      scope: scope
+    }
+  );
 
   var url = util.format('%s/oauth2/token', BASE_URL);
 
@@ -112,21 +150,24 @@ netatmo.prototype.authenticate = function (args, callback) {
     form: form,
   }, function (err, response, body) {
     if (err || response.statusCode != 200) {
+      console.log(err, response, body, url, form);
       return this.handleRequestError(err, response, body, "Authenticate error", true);
     }
 
     body = JSON.parse(body);
 
     access_token = body.access_token;
+    refresh_token = body.refresh_token;
 
     if (body.expires_in) {
-      setTimeout(this.authenticate_refresh.bind(this), body.expires_in * 1000, body.refresh_token);
+      clearTimeout(auth_refresh_timeout);
+      auth_refresh_timeout = setTimeout(this.authenticate_refresh.bind(this), body.expires_in * 1000, body.refresh_token);
     }
 
     this.emit('authenticated');
 
     if (callback) {
-      return callback();
+      return callback(body);
     }
 
     return this;
@@ -140,7 +181,7 @@ netatmo.prototype.authenticate = function (args, callback) {
  * @param refresh_token
  * @returns {netatmo}
  */
-netatmo.prototype.authenticate_refresh = function (refresh_token) {
+netatmo.prototype.authenticate_refresh = function (refresh_token, callback) {
 
   var form = {
     grant_type: 'refresh_token',
@@ -163,9 +204,15 @@ netatmo.prototype.authenticate_refresh = function (refresh_token) {
     body = JSON.parse(body);
 
     access_token = body.access_token;
+    refresh_token = body.refresh_token;
 
     if (body.expires_in) {
-      setTimeout(this.authenticate_refresh.bind(this), body.expires_in * 1000, body.refresh_token);
+      clearTimeout(auth_refresh_timeout);
+      auth_refresh_timeout = setTimeout(this.authenticate_refresh.bind(this), body.expires_in * 1000, body.refresh_token);
+    }
+
+    if (callback) {
+      return callback(body);
     }
 
     return this;
@@ -201,7 +248,7 @@ netatmo.prototype.getUser = function (callback) {
     form: form,
   }, function (err, response, body) {
     if (err || response.statusCode != 200) {
-      return this.handleRequestError(err, response, body, "getUser error");
+      return this.handleRequestError(err, response, body, "getUser error", this.getUser.bind(this, callback));
     }
 
     body = JSON.parse(body);
@@ -256,7 +303,7 @@ netatmo.prototype.getDevicelist = function (options, callback) {
     form: form,
   }, function (err, response, body) {
     if (err || response.statusCode != 200) {
-      return this.handleRequestError(err, response, body, "getDevicelist error");
+      return this.handleRequestError(err, response, body, "getDevicelist error", this.getDevicelist.bind(this, options, callback));
     }
 
     body = JSON.parse(body);
@@ -312,7 +359,7 @@ netatmo.prototype.getStationsData = function (options, callback) {
     form: form,
   }, function (err, response, body) {
     if (err || response.statusCode != 200) {
-      return this.handleRequestError(err, response, body, "getStationsDataError error");
+      return this.handleRequestError(err, response, body, "getStationsDataError error", this.getStationData.bind(this, options, callback));
     }
 
     body = JSON.parse(body);
@@ -361,7 +408,7 @@ netatmo.prototype.getThermostatsData = function (options, callback) {
     method: "GET",
   }, function (err, response, body) {
     if (err || response.statusCode != 200) {
-      return this.handleRequestError(err, response, body, "getThermostatsDataError error");
+      return this.handleRequestError(err, response, body, "getThermostatsDataError error", this.getThermostatsData.bind(this, options, callback));
     }
 
     body = JSON.parse(body);
@@ -478,7 +525,7 @@ netatmo.prototype.getMeasure = function (options, callback) {
     form: form,
   }, function (err, response, body) {
     if (err || response.statusCode != 200) {
-      var error = this.handleRequestError(err, response, body, "getMeasure error");
+      var error = this.handleRequestError(err, response, body, "getMeasure error", this.getMeasure.bind(this, options, callback));
       if (callback) {
         callback(error);
       }
@@ -546,7 +593,7 @@ netatmo.prototype.getThermstate = function (options, callback) {
     form: form,
   }, function (err, response, body) {
     if (err || response.statusCode != 200) {
-      return this.handleRequestError(err, response, body, "getThermstate error");
+      return this.handleRequestError(err, response, body, "getThermstate error", this.getThermstate.bind(this, options, callback));
     }
 
     body = JSON.parse(body);
@@ -619,7 +666,7 @@ netatmo.prototype.setSyncSchedule = function (options, callback) {
     form: form,
   }, function (err, response, body) {
     if (err || response.statusCode != 200) {
-      return this.handleRequestError(err, response, body, "setSyncSchedule error");
+      return this.handleRequestError(err, response, body, "setSyncSchedule error", this.setSyncSchedule.bind(this, options, callback));
     }
 
     body = JSON.parse(body);
@@ -698,7 +745,7 @@ netatmo.prototype.setThermpoint = function (options, callback) {
     form: form,
   }, function (err, response, body) {
     if (err || response.statusCode != 200) {
-      return this.handleRequestError(err, response, body, "setThermpoint error");
+      return this.handleRequestError(err, response, body, "setThermpoint error", this.setThermpoint.bind(this, options, callback));
     }
 
     body = JSON.parse(body);
@@ -759,7 +806,7 @@ netatmo.prototype.getHomeData = function (options, callback) {
     form: form,
   }, function (err, response, body) {
     if (err || response.statusCode != 200) {
-      return this.handleRequestError(err, response, body, "getHomeData error");
+      return this.handleRequestError(err, response, body, "getHomeData error", this.getHomeData.bind(this, options, callback));
     }
 
     body = JSON.parse(body);
@@ -824,7 +871,7 @@ netatmo.prototype.getNextEvents = function (options, callback) {
     form: form,
   }, function (err, response, body) {
     if (err || response.statusCode != 200) {
-      return this.handleRequestError(err, response, body, "getNextEvents error");
+      return this.handleRequestError(err, response, body, "getNextEvents error", this.getNextEvents.bind(this, options, callback));
     }
 
     body = JSON.parse(body);
@@ -889,7 +936,7 @@ netatmo.prototype.getLastEventOf = function (options, callback) {
     form: form,
   }, function (err, response, body) {
     if (err || response.statusCode != 200) {
-      return this.handleRequestError(err, response, body, "getLastEventOf error");
+      return this.handleRequestError(err, response, body, "getLastEventOf error", this.getLastEventOf.bind(this, options, callback));
     }
 
     body = JSON.parse(body);
@@ -950,7 +997,7 @@ netatmo.prototype.getEventsUntil = function (options, callback) {
     form: form,
   }, function (err, response, body) {
     if (err || response.statusCode != 200) {
-      return this.handleRequestError(err, response, body, "getEventsUntil error");
+      return this.handleRequestError(err, response, body, "getEventsUntil error", this.getEventsUntil.bind(this, options, callback));
     }
 
     body = JSON.parse(body);
@@ -1013,7 +1060,7 @@ netatmo.prototype.getCameraPicture = function (options, callback) {
     contentType: 'image/jpg'
   }, function (err, response, body) {
     if (err || response.statusCode != 200) {
-      return this.handleRequestError(err, response, body, "getCameraPicture error");
+      return this.handleRequestError(err, response, body, "getCameraPicture error", this.getCameraPicture.bind(this, options, callback));
     }
 
     this.emit('get-camerapicture', err, body);
